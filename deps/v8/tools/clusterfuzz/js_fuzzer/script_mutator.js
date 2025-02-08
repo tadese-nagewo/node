@@ -15,6 +15,7 @@ const common = require('./mutators/common.js');
 const db = require('./db.js');
 const exceptions = require('./exceptions.js');
 const random = require('./random.js');
+const runner = require('./runner.js');
 const sourceHelpers = require('./source_helpers.js');
 
 const { AddTryCatchMutator } = require('./mutators/try_catch.js');
@@ -23,6 +24,7 @@ const { CrossOverMutator } = require('./mutators/crossover_mutator.js');
 const { ExpressionMutator } = require('./mutators/expression_mutator.js');
 const { FunctionCallMutator } = require('./mutators/function_call_mutator.js');
 const { IdentifierNormalizer } = require('./mutators/normalizer.js');
+const { MutationContext } = require('./mutators/mutator.js');
 const { NumberMutator } = require('./mutators/number_mutator.js');
 const { ObjectMutator } = require('./mutators/object_mutator.js');
 const { VariableMutator } = require('./mutators/variable_mutator.js');
@@ -72,6 +74,16 @@ class ScriptMutator {
     this.settings = settings;
   }
 
+  /**
+   * Returns a runner class that decides the composition of tests from
+   * different corpora.
+   */
+  get runnerClass() {
+    // Choose a setup with the Fuzzilli corpus with a 50% chance.
+    return random.single(
+        [runner.RandomCorpusRunner, runner.RandomCorpusRunnerWithFuzzilli]);
+  }
+
   _addMjsunitIfNeeded(dependencies, input) {
     if (dependencies.has('mjsunit')) {
       return;
@@ -91,7 +103,7 @@ class ScriptMutator {
     if (path.basename(mjsunitPath) == 'mjsunit') {
       mjsunitPath = path.join(mjsunitPath, 'mjsunit.js');
       dependencies.set('mjsunit', sourceHelpers.loadDependencyAbs(
-          input.baseDir, mjsunitPath));
+          input.corpus, mjsunitPath));
       return;
     }
 
@@ -120,22 +132,33 @@ class ScriptMutator {
     for (let i = shellJsPaths.length - 1; i >= 0; i--) {
       if (!dependencies.has(shellJsPaths[i])) {
         const dependency = sourceHelpers.loadDependencyAbs(
-            input.baseDir, shellJsPaths[i]);
+            input.corpus, shellJsPaths[i]);
         dependencies.set(shellJsPaths[i], dependency);
       }
     }
   }
 
-  _addJSTestStubsIfNeeded(dependencies, input) {
-    if (dependencies.has('jstest_stubs') ||
-        !input.absPath.includes('JSTests')) {
+  _addStubsIfNeeded(dependencies, input, baseName, corpusDir) {
+    if (dependencies.has(baseName) || !input.absPath.includes(corpusDir)) {
       return;
     }
-    dependencies.set(
-        'jstest_stubs', sourceHelpers.loadResource('jstest_stubs.js'));
+    dependencies.set(baseName, sourceHelpers.loadResource(baseName + '.js'));
   }
 
-  mutate(source) {
+  _addJSTestStubsIfNeeded(dependencies, input) {
+    this._addStubsIfNeeded(dependencies, input, 'jstest_stubs', 'JSTests');
+  }
+
+  _addChakraStubsIfNeeded(dependencies, input) {
+    this._addStubsIfNeeded(dependencies, input, 'chakra_stubs', 'chakra');
+  }
+
+  _addSpidermonkeyStubsIfNeeded(dependencies, input) {
+    this._addStubsIfNeeded(
+        dependencies, input, 'spidermonkey_stubs', 'spidermonkey');
+  }
+
+  mutate(source, context) {
     let mutators = this.mutators.slice();
     let annotations = [];
     if (random.choose(this.settings.SCRIPT_MUTATOR_SHUFFLE)){
@@ -155,7 +178,7 @@ class ScriptMutator {
     mutators.push(this.trycatch);
 
     for (const mutator of mutators) {
-      mutator.mutate(source);
+      mutator.mutate(source, context);
     }
 
     for (const annotation of annotations.reverse()) {
@@ -174,7 +197,9 @@ class ScriptMutator {
         // that are not recursively resolved. We already remove them, but we
         // also need to load the dependencies they point to.
         this._addJSTestStubsIfNeeded(dependencies, input);
-        this._addMjsunitIfNeeded(dependencies, input)
+        this._addChakraStubsIfNeeded(dependencies, input);
+        this._addMjsunitIfNeeded(dependencies, input);
+        this._addSpidermonkeyStubsIfNeeded(dependencies, input);
         this._addSpiderMonkeyShellIfNeeded(dependencies, input);
       } catch (e) {
         console.log(
@@ -215,10 +240,11 @@ class ScriptMutator {
   // Normalizes, combines and mutates multiple inputs.
   mutateInputs(inputs) {
     const normalizerMutator = new IdentifierNormalizer();
+    const context = new MutationContext();
 
     for (const [index, input] of inputs.entries()) {
       try {
-        normalizerMutator.mutate(input);
+        normalizerMutator.mutate(input, context);
       } catch (e) {
         console.log('ERROR: Failed to normalize ', input.relPath);
         throw e;
@@ -230,7 +256,7 @@ class ScriptMutator {
     // Combine ASTs into one. This is so that mutations have more context to
     // cross over content between ASTs (e.g. variables).
     const combinedSource = common.concatPrograms(inputs);
-    this.mutate(combinedSource);
+    this.mutate(combinedSource, context);
 
     return combinedSource;
   }
@@ -240,12 +266,14 @@ class ScriptMutator {
     // 1) Compute dependencies from inputs.
     // 2) Normalize, combine and mutate inputs.
     // 3) Generate code with dependency code prepended.
+    // 4) Combine and filter flags from inputs.
     const dependencies = this.resolveDependencies(inputs);
     const combinedSource = this.mutateInputs(inputs);
     const code = sourceHelpers.generateCode(combinedSource, dependencies);
-    const flags = exceptions.resolveContradictoryFlags(
-        common.concatFlags(dependencies.concat([combinedSource])));
-    return new Result(code, flags);
+    const allFlags = common.concatFlags(dependencies.concat([combinedSource]));
+    const filteredFlags = exceptions.resolveContradictoryFlags(
+        exceptions.filterFlags(allFlags));
+    return new Result(code, filteredFlags);
   }
 }
 

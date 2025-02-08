@@ -20,16 +20,19 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <ostream>
 #include <random>
+#include <set>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -574,6 +577,48 @@ template <int N, bool kSoo>
 using SizedValuePolicy =
     ValuePolicy<SizedValue<N>, /*kTransferable=*/true, kSoo>;
 
+// Value is aligned as type T and contains N copies of it.
+template <typename T, int N>
+class AlignedValue {
+ public:
+  AlignedValue(int64_t v) {  // NOLINT
+    for (int i = 0; i < N; ++i) {
+      vals_[i] = v;
+      if (sizeof(T) < sizeof(int64_t)) {
+        v >>= (8 * sizeof(T));
+      } else {
+        v = 0;
+      }
+    }
+  }
+  AlignedValue() : AlignedValue(0) {}
+  AlignedValue(const AlignedValue&) = default;
+  AlignedValue& operator=(const AlignedValue&) = default;
+
+  int64_t operator*() const {
+    if (sizeof(T) == sizeof(int64_t)) {
+      return vals_[0];
+    }
+    int64_t result = 0;
+    for (int i = N - 1; i >= 0; --i) {
+      result <<= (8 * sizeof(T));
+      result += vals_[i];
+    }
+    return result;
+  }
+  explicit operator int() const { return **this; }
+  explicit operator int64_t() const { return **this; }
+
+  template <typename H>
+  friend H AbslHashValue(H h, AlignedValue sv) {
+    return H::combine(std::move(h), *sv);
+  }
+  bool operator==(const AlignedValue& rhs) const { return **this == *rhs; }
+
+ private:
+  T vals_[N];
+};
+
 class StringPolicy {
   template <class F, class K, class V,
             class = typename std::enable_if<
@@ -940,8 +985,42 @@ TYPED_TEST(SooTest, InsertWithinCapacity) {
 template <class TableType>
 class SmallTableResizeTest : public testing::Test {};
 
-using SmallTableTypes =
-    ::testing::Types<IntTable, TransferableIntTable, SooIntTable>;
+using SmallTableTypes = ::testing::Types<
+    IntTable, TransferableIntTable, SooIntTable,
+    // int8
+    ValueTable<int8_t, /*kTransferable=*/true, /*kSoo=*/true>,
+    ValueTable<int8_t, /*kTransferable=*/false, /*kSoo=*/true>,
+    // int16
+    ValueTable<int16_t, /*kTransferable=*/true, /*kSoo=*/true>,
+    ValueTable<int16_t, /*kTransferable=*/false, /*kSoo=*/true>,
+    // int128
+    ValueTable<SizedValue<16>, /*kTransferable=*/true, /*kSoo=*/true>,
+    ValueTable<SizedValue<16>, /*kTransferable=*/false, /*kSoo=*/true>,
+    // int192
+    ValueTable<SizedValue<24>, /*kTransferable=*/true, /*kSoo=*/true>,
+    ValueTable<SizedValue<24>, /*kTransferable=*/false, /*kSoo=*/true>,
+    // Special tables.
+    MinimumAlignmentUint8Table,
+    CustomAllocIntTable,
+    BadTable,
+    // alignment 1, size 2.
+    ValueTable<AlignedValue<uint8_t, 2>, /*kTransferable=*/true, /*kSoo=*/true>,
+    ValueTable<AlignedValue<uint8_t, 2>, /*kTransferable=*/false,
+               /*kSoo=*/true>,
+    // alignment 1, size 7.
+    ValueTable<AlignedValue<uint8_t, 7>, /*kTransferable=*/true, /*kSoo=*/true>,
+    ValueTable<AlignedValue<uint8_t, 7>, /*kTransferable=*/false,
+               /*kSoo=*/true>,
+    // alignment 2, size 6.
+    ValueTable<AlignedValue<uint16_t, 3>, /*kTransferable=*/true,
+               /*kSoo=*/true>,
+    ValueTable<AlignedValue<uint16_t, 3>, /*kTransferable=*/false,
+               /*kSoo=*/true>,
+    // alignment 2, size 10.
+    ValueTable<AlignedValue<uint16_t, 5>, /*kTransferable=*/true,
+               /*kSoo=*/true>,
+    ValueTable<AlignedValue<uint16_t, 5>, /*kTransferable=*/false,
+               /*kSoo=*/true>>;
 TYPED_TEST_SUITE(SmallTableResizeTest, SmallTableTypes);
 
 TYPED_TEST(SmallTableResizeTest, InsertIntoSmallTable) {
@@ -960,6 +1039,9 @@ TYPED_TEST(SmallTableResizeTest, ResizeGrowSmallTables) {
   for (size_t source_size = 0; source_size < 32; ++source_size) {
     for (size_t target_size = source_size; target_size < 32; ++target_size) {
       for (bool rehash : {false, true}) {
+        SCOPED_TRACE(absl::StrCat("source_size: ", source_size,
+                                  ", target_size: ", target_size,
+                                  ", rehash: ", rehash));
         TypeParam t;
         for (size_t i = 0; i < source_size; ++i) {
           t.insert(static_cast<int>(i));
@@ -2434,8 +2516,9 @@ TYPED_TEST(SooTest, HintInsert) {
 }
 
 template <typename T>
-T MakeSimpleTable(size_t size) {
+T MakeSimpleTable(size_t size, bool do_reserve) {
   T t;
+  if (do_reserve) t.reserve(size);
   while (t.size() < size) t.insert(t.size());
   return t;
 }
@@ -2454,51 +2537,62 @@ std::vector<int> OrderOfIteration(const T& t) {
 // We also need to keep the old tables around to avoid getting the same memory
 // blocks over and over.
 TYPED_TEST(SooTest, IterationOrderChangesByInstance) {
-  for (size_t size : {2, 6, 12, 20}) {
-    const auto reference_table = MakeSimpleTable<TypeParam>(size);
-    const auto reference = OrderOfIteration(reference_table);
+  for (bool do_reserve : {false, true}) {
+    for (size_t size : {2u, 6u, 12u, 20u}) {
+      SCOPED_TRACE(absl::StrCat("size: ", size, " do_reserve: ", do_reserve));
+      const auto reference_table = MakeSimpleTable<TypeParam>(size, do_reserve);
+      const auto reference = OrderOfIteration(reference_table);
 
-    std::vector<TypeParam> tables;
-    bool found_difference = false;
-    for (int i = 0; !found_difference && i < 5000; ++i) {
-      tables.push_back(MakeSimpleTable<TypeParam>(size));
-      found_difference = OrderOfIteration(tables.back()) != reference;
-    }
-    if (!found_difference) {
-      FAIL()
-          << "Iteration order remained the same across many attempts with size "
-          << size;
+      std::vector<TypeParam> tables;
+      bool found_difference = false;
+      for (int i = 0; !found_difference && i < 5000; ++i) {
+        tables.push_back(MakeSimpleTable<TypeParam>(size, do_reserve));
+        found_difference = OrderOfIteration(tables.back()) != reference;
+      }
+      if (!found_difference) {
+        FAIL() << "Iteration order remained the same across many attempts with "
+                  "size "
+               << size;
+      }
     }
   }
 }
 
 TYPED_TEST(SooTest, IterationOrderChangesOnRehash) {
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+  GTEST_SKIP() << "Hash quality is lower in asan mode, causing flakiness.";
+#endif
+
   // We test different sizes with many small numbers, because small table
   // resize has a different codepath.
   // Note: iteration order for size() <= 1 is always the same.
-  for (size_t size : std::vector<size_t>{2, 3, 6, 7, 12, 15, 20, 50}) {
-    for (size_t rehash_size : {
-             size_t{0},  // Force rehash is guaranteed.
-             size * 10   // Rehash to the larger capacity is guaranteed.
-         }) {
-      std::vector<TypeParam> garbage;
-      bool ok = false;
-      for (int i = 0; i < 5000; ++i) {
-        auto t = MakeSimpleTable<TypeParam>(size);
-        const auto reference = OrderOfIteration(t);
-        // Force rehash.
-        t.rehash(rehash_size);
-        auto trial = OrderOfIteration(t);
-        if (trial != reference) {
-          // We are done.
-          ok = true;
-          break;
+  for (bool do_reserve : {false, true}) {
+    for (size_t size : {2u, 3u, 6u, 7u, 12u, 15u, 20u, 50u}) {
+      for (size_t rehash_size : {
+               size_t{0},        // Force rehash is guaranteed.
+               size * 10  // Rehash to the larger capacity is guaranteed.
+           }) {
+        SCOPED_TRACE(absl::StrCat("size: ", size, " rehash_size: ", rehash_size,
+                                  " do_reserve: ", do_reserve));
+        std::vector<TypeParam> garbage;
+        bool ok = false;
+        for (int i = 0; i < 5000; ++i) {
+          auto t = MakeSimpleTable<TypeParam>(size, do_reserve);
+          const auto reference = OrderOfIteration(t);
+          // Force rehash.
+          t.rehash(rehash_size);
+          auto trial = OrderOfIteration(t);
+          if (trial != reference) {
+            // We are done.
+            ok = true;
+            break;
+          }
+          garbage.push_back(std::move(t));
         }
-        garbage.push_back(std::move(t));
+        EXPECT_TRUE(ok)
+            << "Iteration order remained the same across many attempts " << size
+            << "->" << rehash_size << ".";
       }
-      EXPECT_TRUE(ok)
-          << "Iteration order remained the same across many attempts " << size
-          << "->" << rehash_size << ".";
     }
   }
 }
@@ -3552,7 +3646,7 @@ TEST(Table, RehashToSooUnsampled) {
 }
 
 TEST(Table, ReserveToNonSoo) {
-  for (int reserve_capacity : {8, 100000}) {
+  for (size_t reserve_capacity : {8u, 100000u}) {
     SooIntTable t;
     t.insert(0);
 
@@ -3685,11 +3779,23 @@ TEST(Table, MovedFromCallsFail) {
   }
 
   {
-    ABSL_ATTRIBUTE_UNUSED IntTable t1, t2;
+    ABSL_ATTRIBUTE_UNUSED IntTable t1, t2, t3;
     t1.insert(1);
     t2 = std::move(t1);
     // NOLINTNEXTLINE(bugprone-use-after-move)
     EXPECT_DEATH_IF_SUPPORTED(t1.contains(1), "moved-from");
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_DEATH_IF_SUPPORTED(t1.swap(t3), "moved-from");
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_DEATH_IF_SUPPORTED(t1.merge(t3), "moved-from");
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_DEATH_IF_SUPPORTED(IntTable{t1}, "moved-from");
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_DEATH_IF_SUPPORTED(t1.begin(), "moved-from");
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_DEATH_IF_SUPPORTED(t1.end(), "moved-from");
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_DEATH_IF_SUPPORTED(t1.size(), "moved-from");
   }
   {
     ABSL_ATTRIBUTE_UNUSED IntTable t1;
@@ -3699,6 +3805,24 @@ TEST(Table, MovedFromCallsFail) {
     EXPECT_DEATH_IF_SUPPORTED(t1.contains(1), "moved-from");
     t1.clear();  // Clearing a moved-from table is allowed.
   }
+  {
+    // Test that using a table (t3) that was moved-to from a moved-from table
+    // (t1) fails.
+    ABSL_ATTRIBUTE_UNUSED IntTable t1, t2, t3;
+    t1.insert(1);
+    t2 = std::move(t1);
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    t3 = std::move(t1);
+    EXPECT_DEATH_IF_SUPPORTED(t3.contains(1), "moved-from");
+  }
+}
+
+TEST(Table, MaxSizeOverflow) {
+  size_t overflow = (std::numeric_limits<size_t>::max)();
+  EXPECT_DEATH_IF_SUPPORTED(IntTable t(overflow), "Hash table size overflow");
+  IntTable t;
+  EXPECT_DEATH_IF_SUPPORTED(t.reserve(overflow), "Hash table size overflow");
+  EXPECT_DEATH_IF_SUPPORTED(t.rehash(overflow), "Hash table size overflow");
 }
 
 }  // namespace

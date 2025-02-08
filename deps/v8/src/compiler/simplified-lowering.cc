@@ -16,7 +16,6 @@
 #include "src/compiler/common-operator.h"
 #include "src/compiler/compiler-source-position-table.h"
 #include "src/compiler/diamond.h"
-#include "src/compiler/graph-visualizer.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/linkage.h"
 #include "src/compiler/node-matchers.h"
@@ -27,6 +26,7 @@
 #include "src/compiler/representation-change.h"
 #include "src/compiler/simplified-lowering-verifier.h"
 #include "src/compiler/simplified-operator.h"
+#include "src/compiler/turbofan-graph-visualizer.h"
 #include "src/compiler/type-cache.h"
 #include "src/numbers/conversions-inl.h"
 #include "src/objects/objects.h"
@@ -99,7 +99,7 @@ MachineRepresentation MachineRepresentationFromArrayType(
     case kExternalBigUint64Array:
       return MachineRepresentation::kWord64;
     case kExternalFloat16Array:
-      UNIMPLEMENTED();
+      return MachineRepresentation::kWord16;
   }
   UNREACHABLE();
 }
@@ -211,11 +211,11 @@ bool CanOverflowSigned32(const Operator* op, Type left, Type right,
   right = Type::Intersect(right, Type::Signed32(), type_zone);
   if (left.IsNone() || right.IsNone()) return false;
   switch (op->opcode()) {
-    case IrOpcode::kSpeculativeSafeIntegerAdd:
+    case IrOpcode::kSpeculativeSmallIntegerAdd:
       return (left.Max() + right.Max() > kMaxInt) ||
              (left.Min() + right.Min() < kMinInt);
 
-    case IrOpcode::kSpeculativeSafeIntegerSubtract:
+    case IrOpcode::kSpeculativeSmallIntegerSubtract:
       return (left.Max() - right.Min() > kMaxInt) ||
              (left.Min() - right.Max() < kMinInt);
 
@@ -249,6 +249,21 @@ class JSONGraphWriterWithVerifierTypes : public JSONGraphWriter {
  private:
   SimplifiedLoweringVerifier* verifier_;
 };
+
+bool IsLoadFloat16ArrayElement(Node* node) {
+  Operator::Opcode opcode = node->op()->opcode();
+  return (opcode == IrOpcode::kLoadTypedElement ||
+          opcode == IrOpcode::kLoadDataViewElement) &&
+         ExternalArrayTypeOf(node->op()) == kExternalFloat16Array;
+}
+
+constexpr bool SupportsFpParamsInCLinkage() {
+#ifdef V8_ENABLE_FP_PARAMS_IN_C_LINKAGE
+  return Is64();
+#else
+  return false;
+#endif
+}
 
 }  // namespace
 
@@ -494,6 +509,11 @@ class RepresentationSelector {
                                    info->restriction_type(), graph_zone());
         break;
 
+      case IrOpcode::kCheckNumberFitsInt32:
+        new_type = Type::Intersect(op_typer_.CheckNumberFitsInt32(input0_type),
+                                   info->restriction_type(), graph_zone());
+        break;
+
       case IrOpcode::kPhi: {
         new_type = TypePhi(node);
         if (!type.IsInvalid()) {
@@ -514,6 +534,14 @@ class RepresentationSelector {
       }
 
       case IrOpcode::kSelect: {
+        const auto& p = SelectParametersOf(node->op());
+        if (p.semantics() == BranchSemantics::kMachine) {
+          if (type.IsInvalid()) {
+            GetInfo(node)->set_feedback_type(NodeProperties::GetType(node));
+            return true;
+          }
+          return false;
+        }
         new_type = TypeSelect(node);
         break;
       }
@@ -758,7 +786,7 @@ class RepresentationSelector {
     }
   }
 
-  void RunVerifyPhase(OptimizedCompilationInfo* info) {
+  void RunVerifyPhase(OptimizedCompilationInfo* compilation_info) {
     DCHECK_NOT_NULL(verifier_);
 
     TRACE("--{Verify Phase}--\n");
@@ -790,11 +818,11 @@ class RepresentationSelector {
     }
 
     // Print graph.
-    if (info != nullptr && info->trace_turbo_json()) {
+    if (compilation_info != nullptr && compilation_info->trace_turbo_json()) {
       UnparkedScopeIfNeeded scope(broker_);
       AllowHandleDereference allow_deref;
 
-      TurboJsonFile json_of(info, std::ios_base::app);
+      TurboJsonFile json_of(compilation_info, std::ios_base::app);
       JSONGraphWriter writer(json_of, graph(), source_positions_,
                              node_origins_);
       writer.PrintPhase("V8.TFSimplifiedLowering [after lower]");
@@ -806,11 +834,11 @@ class RepresentationSelector {
     }
 
     // Print graph.
-    if (info != nullptr && info->trace_turbo_json()) {
+    if (compilation_info != nullptr && compilation_info->trace_turbo_json()) {
       UnparkedScopeIfNeeded scope(broker_);
       AllowHandleDereference allow_deref;
 
-      TurboJsonFile json_of(info, std::ios_base::app);
+      TurboJsonFile json_of(compilation_info, std::ios_base::app);
       JSONGraphWriterWithVerifierTypes writer(
           json_of, graph(), source_positions_, node_origins_, verifier_);
       writer.PrintPhase("V8.TFSimplifiedLowering [after verify]");
@@ -1382,12 +1410,17 @@ class RepresentationSelector {
   void VisitStateValues(Node* node) {
     if (propagate<T>()) {
       for (int i = 0; i < node->InputCount(); i++) {
-        // BigInt64s are rematerialized in deoptimization. The other BigInts
-        // must be rematerialized before deoptimization. By propagating an
-        // AnyTagged use, the RepresentationChanger is going to insert the
-        // necessary conversions.
         if (IsLargeBigInt(TypeOf(node->InputAt(i)))) {
+          // BigInt64s are rematerialized in deoptimization. The other BigInts
+          // must be rematerialized before deoptimization. By propagating an
+          // AnyTagged use, the RepresentationChanger is going to insert the
+          // necessary conversions.
           EnqueueInput<T>(node, i, UseInfo::AnyTagged());
+        } else if (IsLoadFloat16ArrayElement(node->InputAt(i))) {
+          // Loads from Float16Arrays are raw bits as word16s but have the
+          // Number type, since not all archs have native float16
+          // representation. Rematerialize them as float64s in deoptimization.
+          EnqueueInput<T>(node, i, UseInfo::Float64());
         } else {
           EnqueueInput<T>(node, i, UseInfo::Any());
         }
@@ -1398,12 +1431,14 @@ class RepresentationSelector {
           zone->New<ZoneVector<MachineType>>(node->InputCount(), zone);
       for (int i = 0; i < node->InputCount(); i++) {
         Node* input = node->InputAt(i);
+        MachineRepresentation input_rep = GetInfo(input)->representation();
         if (IsLargeBigInt(TypeOf(input))) {
           ConvertInput(node, i, UseInfo::AnyTagged());
+        } else if (IsLoadFloat16ArrayElement(input)) {
+          ConvertInput(node, i, UseInfo::Float64());
+          input_rep = MachineRepresentation::kFloat64;
         }
-
-        (*types)[i] =
-            DeoptMachineTypeOf(GetInfo(input)->representation(), TypeOf(input));
+        (*types)[i] = DeoptMachineTypeOf(input_rep, TypeOf(input));
       }
       SparseInputMask mask = SparseInputMaskOf(node->op());
       ChangeOp(node, common()->TypedStateValues(types, mask));
@@ -1430,15 +1465,26 @@ class RepresentationSelector {
       if (IsLargeBigInt(TypeOf(accumulator))) {
         EnqueueInput<T>(node, FrameState::kFrameStateStackInput,
                         UseInfo::AnyTagged());
+      } else if (IsLoadFloat16ArrayElement(accumulator)) {
+        EnqueueInput<T>(node, FrameState::kFrameStateStackInput,
+                        UseInfo::Float64());
       } else {
         EnqueueInput<T>(node, FrameState::kFrameStateStackInput,
                         UseInfo::Any());
       }
     } else if (lower<T>()) {
-      if (IsLargeBigInt(TypeOf(accumulator))) {
+      MachineRepresentation accumulator_rep =
+          GetInfo(accumulator)->representation();
+      Type accumulator_type = TypeOf(accumulator);
+      if (IsLargeBigInt(accumulator_type)) {
         ConvertInput(node, FrameState::kFrameStateStackInput,
                      UseInfo::AnyTagged());
         accumulator = node.stack();
+      } else if (IsLoadFloat16ArrayElement(accumulator)) {
+        ConvertInput(node, FrameState::kFrameStateStackInput,
+                     UseInfo::Float64());
+        accumulator = node.stack();
+        accumulator_rep = MachineRepresentation::kFloat64;
       }
       Zone* zone = jsgraph_->zone();
       if (accumulator == jsgraph_->OptimizedOutConstant()) {
@@ -1447,8 +1493,7 @@ class RepresentationSelector {
       } else {
         ZoneVector<MachineType>* types =
             zone->New<ZoneVector<MachineType>>(1, zone);
-        (*types)[0] = DeoptMachineTypeOf(GetInfo(accumulator)->representation(),
-                                         TypeOf(accumulator));
+        (*types)[0] = DeoptMachineTypeOf(accumulator_rep, accumulator_type);
 
         node->ReplaceInput(
             FrameState::kFrameStateStackInput,
@@ -1473,6 +1518,8 @@ class RepresentationSelector {
       for (int i = 0; i < node->InputCount(); i++) {
         if (IsLargeBigInt(TypeOf(node->InputAt(i)))) {
           EnqueueInput<T>(node, i, UseInfo::AnyTagged());
+        } else if (IsLoadFloat16ArrayElement(node->InputAt(i))) {
+          EnqueueInput<T>(node, i, UseInfo::Float64());
         } else {
           EnqueueInput<T>(node, i, UseInfo::Any());
         }
@@ -1483,11 +1530,14 @@ class RepresentationSelector {
           zone->New<ZoneVector<MachineType>>(node->InputCount(), zone);
       for (int i = 0; i < node->InputCount(); i++) {
         Node* input = node->InputAt(i);
-        (*types)[i] =
-            DeoptMachineTypeOf(GetInfo(input)->representation(), TypeOf(input));
+        MachineRepresentation input_rep = GetInfo(input)->representation();
         if (IsLargeBigInt(TypeOf(input))) {
           ConvertInput(node, i, UseInfo::AnyTagged());
+        } else if (IsLoadFloat16ArrayElement(input)) {
+          ConvertInput(node, i, UseInfo::Float64());
+          input_rep = MachineRepresentation::kFloat64;
         }
+        (*types)[i] = DeoptMachineTypeOf(input_rep, TypeOf(input));
       }
       ChangeOp(node, common()->TypedObjectState(ObjectIdOf(node->op()), types));
     }
@@ -1632,8 +1682,8 @@ class RepresentationSelector {
   }
 
   template <Phase T>
-  void VisitSpeculativeIntegerAdditiveOp(Node* node, Truncation truncation,
-                                         SimplifiedLowering* lowering) {
+  void VisitSpeculativeSmallIntegerAdditiveOp(Node* node, Truncation truncation,
+                                              SimplifiedLowering* lowering) {
     Type left_upper = GetUpperBound(node->InputAt(0));
     Type right_upper = GetUpperBound(node->InputAt(1));
 
@@ -1680,7 +1730,7 @@ class RepresentationSelector {
     // subtraction we need to handle the case of -0 - 0 properly, since
     // that can produce -0.
     Type left_constraint_type =
-        node->opcode() == IrOpcode::kSpeculativeSafeIntegerAdd
+        node->opcode() == IrOpcode::kSpeculativeSmallIntegerAdd
             ? Type::Signed32OrMinusZero()
             : Type::Signed32();
     if (left_upper.Is(left_constraint_type) &&
@@ -1694,7 +1744,7 @@ class RepresentationSelector {
       // right-hand side is not minus zero, we do not have to distinguish
       // between 0 and -0.
       IdentifyZeros left_identify_zeros = truncation.identify_zeros();
-      if (node->opcode() == IrOpcode::kSpeculativeSafeIntegerAdd &&
+      if (node->opcode() == IrOpcode::kSpeculativeSmallIntegerAdd &&
           !right_feedback_type.Maybe(Type::MinusZero())) {
         left_identify_zeros = kIdentifyZeros;
       }
@@ -1943,6 +1993,7 @@ class RepresentationSelector {
   UseInfo UseInfoForFastApiCallArgument(CTypeInfo type,
                                         CFunctionInfo::Int64Representation repr,
                                         FeedbackSource const& feedback) {
+    START_ALLOW_USE_DEPRECATED()
     switch (type.GetSequenceType()) {
       case CTypeInfo::SequenceType::kScalar: {
         uint8_t flags = uint8_t(type.GetFlags());
@@ -1993,13 +2044,11 @@ class RepresentationSelector {
         CHECK_EQ(type.GetType(), CTypeInfo::Type::kVoid);
         return UseInfo::AnyTagged();
       }
-      case CTypeInfo::SequenceType::kIsTypedArray: {
-        return UseInfo::AnyTagged();
-      }
       default: {
         UNREACHABLE();  // TODO(mslekova): Implement array buffers.
       }
     }
+    END_ALLOW_USE_DEPRECATED()
   }
 
   static constexpr int kInitialArgumentsCount = 10;
@@ -2013,7 +2062,7 @@ class RepresentationSelector {
     // argument, which must be a JSArray in one function and a TypedArray in the
     // other function, and both JSArrays and TypedArrays have the same UseInfo
     // UseInfo::AnyTagged(). All the other argument types must match.
-    const CFunctionInfo* c_signature = op_params.c_functions()[0].signature;
+    const CFunctionInfo* c_signature = op_params.c_function().signature;
     const int c_arg_count = c_signature->ArgumentCount();
     CallDescriptor* call_descriptor = op_params.descriptor();
     // Arguments for CallApiCallbackOptimizedXXX builtin (including context)
@@ -2055,12 +2104,8 @@ class RepresentationSelector {
 
     // Effect and Control.
     ProcessRemainingInputs<T>(node, value_input_count);
-    if (op_params.c_functions().empty()) {
-      SetOutput<T>(node, MachineRepresentation::kTagged);
-      return;
-    }
 
-    CTypeInfo return_type = op_params.c_functions()[0].signature->ReturnInfo();
+    CTypeInfo return_type = op_params.c_function().signature->ReturnInfo();
     switch (return_type.GetType()) {
       case CTypeInfo::Type::kBool:
         SetOutput<T>(node, MachineRepresentation::kBit);
@@ -2208,7 +2253,8 @@ class RepresentationSelector {
   }
 
 #if V8_ENABLE_WEBASSEMBLY
-  static MachineType MachineTypeForWasmReturnType(wasm::ValueType type) {
+  static MachineType MachineTypeForWasmReturnType(
+      wasm::CanonicalValueType type) {
     switch (type.kind()) {
       case wasm::kI32:
         return MachineType::Int32();
@@ -2226,7 +2272,8 @@ class RepresentationSelector {
     }
   }
 
-  UseInfo UseInfoForJSWasmCallArgument(Node* input, wasm::ValueType type,
+  UseInfo UseInfoForJSWasmCallArgument(Node* input,
+                                       wasm::CanonicalValueType type,
                                        FeedbackSource const& feedback) {
     // If the input type is a Number or Oddball, we can directly convert the
     // input into the Wasm native type of the argument. If not, we return
@@ -2260,7 +2307,7 @@ class RepresentationSelector {
     JSWasmCallNode n(node);
 
     JSWasmCallParameters const& params = n.Parameters();
-    const wasm::FunctionSig* wasm_signature = params.signature();
+    const wasm::CanonicalSig* wasm_signature = params.signature();
     int wasm_arg_count = static_cast<int>(wasm_signature->parameter_count());
     DCHECK_EQ(wasm_arg_count, n.ArgumentCount());
 
@@ -2439,8 +2486,19 @@ class RepresentationSelector {
         ProcessInput<T>(node, 0, UseInfo::TruncatingWord32());
         EnqueueInput<T>(node, NodeProperties::FirstControlIndex(node));
         return;
-      case IrOpcode::kSelect:
-        return VisitSelect<T>(node, truncation, lowering);
+      case IrOpcode::kSelect: {
+        const auto& p = SelectParametersOf(node->op());
+        if (p.semantics() == BranchSemantics::kMachine) {
+          // If this is a machine select, all inputs are machine operators.
+          ProcessInput<T>(node, 0, UseInfo::Any());
+          ProcessInput<T>(node, 1, UseInfo::Any());
+          ProcessInput<T>(node, 2, UseInfo::Any());
+          SetOutput<T>(node, p.representation());
+        } else {
+          VisitSelect<T>(node, truncation, lowering);
+        }
+        return;
+      }
       case IrOpcode::kPhi:
         return VisitPhi<T>(node, truncation, lowering);
       case IrOpcode::kCall:
@@ -2599,9 +2657,10 @@ class RepresentationSelector {
         return;
       }
 
-      case IrOpcode::kSpeculativeSafeIntegerAdd:
-      case IrOpcode::kSpeculativeSafeIntegerSubtract:
-        return VisitSpeculativeIntegerAdditiveOp<T>(node, truncation, lowering);
+      case IrOpcode::kSpeculativeSmallIntegerAdd:
+      case IrOpcode::kSpeculativeSmallIntegerSubtract:
+        return VisitSpeculativeSmallIntegerAdditiveOp<T>(node, truncation,
+                                                         lowering);
 
       case IrOpcode::kSpeculativeNumberAdd:
       case IrOpcode::kSpeculativeNumberSubtract:
@@ -3441,6 +3500,20 @@ class RepresentationSelector {
         }
         return;
       }
+      case IrOpcode::kNumberToFloat16RawBits: {
+        if (IsLoadFloat16ArrayElement(node->InputAt(0))) {
+          // Fold away float16 raw bits -> float64 -> float16 raw bits
+          // sequences.
+          VisitUnop<T>(node, UseInfo::TruncatingWord32(),
+                       MachineRepresentation::kWord16);
+          if (lower<T>()) DeferReplacement(node, node->InputAt(0));
+        } else {
+          VisitUnop<T>(node, UseInfo::TruncatingFloat64(),
+                       MachineRepresentation::kWord16);
+          if (lower<T>()) lowering->DoNumberToFloat16RawBits(node);
+        }
+        return;
+      }
       case IrOpcode::kIntegral32OrMinusZeroToBigInt: {
         VisitUnop<T>(node, UseInfo::Word64(kIdentifyZeros),
                      MachineRepresentation::kWord64);
@@ -3717,12 +3790,18 @@ class RepresentationSelector {
         SetOutput<T>(node, MachineRepresentation::kTaggedSigned);
         return;
       }
-      case IrOpcode::kStringLength: {
+      case IrOpcode::kStringLength:
+      case IrOpcode::kStringWrapperLength: {
         // TODO(bmeurer): The input representation should be TaggedPointer.
         // Fix this once we have a dedicated StringConcat/JSStringAdd
         // operator, which marks it's output as TaggedPointer properly.
         VisitUnop<T>(node, UseInfo::AnyTagged(),
                      MachineRepresentation::kWord32);
+        return;
+      }
+      case IrOpcode::kTypedArrayLength: {
+        VisitUnop<T>(node, UseInfo::AnyTagged(),
+                     MachineType::PointerRepresentation());
         return;
       }
       case IrOpcode::kStringSubstring: {
@@ -3766,6 +3845,16 @@ class RepresentationSelector {
       case IrOpcode::kCheckNumber: {
         Type const input_type = TypeOf(node->InputAt(0));
         if (input_type.Is(Type::Number())) {
+          VisitNoop<T>(node, truncation);
+        } else {
+          VisitUnop<T>(node, UseInfo::AnyTagged(),
+                       MachineRepresentation::kTagged);
+        }
+        return;
+      }
+      case IrOpcode::kCheckNumberFitsInt32: {
+        Type const input_type = TypeOf(node->InputAt(0));
+        if (input_type.Is(Type::Signed32())) {
           VisitNoop<T>(node, truncation);
         } else {
           VisitUnop<T>(node, UseInfo::AnyTagged(),
@@ -4461,6 +4550,11 @@ class RepresentationSelector {
             MachineRepresentation::kNone);
       }
       case IrOpcode::kTransitionElementsKind: {
+        return VisitUnop<T>(
+            node, UseInfo::CheckedHeapObjectAsTaggedPointer(FeedbackSource()),
+            MachineRepresentation::kNone);
+      }
+      case IrOpcode::kTransitionElementsKindOrCheckMap: {
         return VisitUnop<T>(
             node, UseInfo::CheckedHeapObjectAsTaggedPointer(FeedbackSource()),
             MachineRepresentation::kNone);
@@ -5619,6 +5713,26 @@ void SimplifiedLowering::DoIntegerToUint8Clamped(Node* node) {
   ChangeOp(node, common()->Select(MachineRepresentation::kFloat64));
 }
 
+void SimplifiedLowering::DoNumberToFloat16RawBits(Node* node) {
+  if (machine()->TruncateFloat64ToFloat16RawBits().IsSupported()) {
+    ChangeOp(node, machine()->TruncateFloat64ToFloat16RawBits().op());
+  } else {
+    Node* value = node->InputAt(0);
+    node->ReplaceInput(0, Ieee754Fp64ToFp16RawBitsCode());
+    if constexpr (SupportsFpParamsInCLinkage()) {
+      node->AppendInput(graph()->zone(), value);
+    } else {
+      node->AppendInput(
+          graph()->zone(),
+          graph()->NewNode(machine()->Float64ExtractHighWord32(), value));
+      node->AppendInput(
+          graph()->zone(),
+          graph()->NewNode(machine()->Float64ExtractLowWord32(), value));
+    }
+    ChangeOp(node, Ieee754Fp64ToFp16RawBitsOperator());
+  }
+}
+
 void SimplifiedLowering::DoNumberToUint8Clamped(Node* node) {
   Node* const input = node->InputAt(0);
   Node* const min = jsgraph()->Float64Constant(0.0);
@@ -5689,6 +5803,20 @@ Node* SimplifiedLowering::ToNumericCode() {
   return to_numeric_code_.get();
 }
 
+Node* SimplifiedLowering::Ieee754Fp64ToFp16RawBitsCode() {
+  if (!ieee754_fp64_to_fp16_raw_bits_code_.is_set()) {
+    if constexpr (SupportsFpParamsInCLinkage()) {
+      ieee754_fp64_to_fp16_raw_bits_code_.set(jsgraph()->ExternalConstant(
+          ExternalReference::ieee754_fp64_to_fp16_raw_bits()));
+    } else {
+      ieee754_fp64_to_fp16_raw_bits_code_.set(jsgraph()->ExternalConstant(
+          ExternalReference::
+              ieee754_fp64_raw_bits_to_fp16_raw_bits_for_32bit_arch()));
+    }
+  }
+  return ieee754_fp64_to_fp16_raw_bits_code_.get();
+}
+
 Operator const* SimplifiedLowering::ToNumberOperator() {
   if (!to_number_operator_.is_set()) {
     Callable callable = Builtins::CallableFor(isolate(), Builtin::kToNumber);
@@ -5727,6 +5855,29 @@ Operator const* SimplifiedLowering::ToNumericOperator() {
     to_numeric_operator_.set(common()->Call(call_descriptor));
   }
   return to_numeric_operator_.get();
+}
+
+Operator const* SimplifiedLowering::Ieee754Fp64ToFp16RawBitsOperator() {
+  if (!ieee754_fp64_to_fp16_raw_bits_operator_.is_set()) {
+    Zone* graph_zone = graph()->zone();
+    CallDescriptor* desc;
+    if constexpr (SupportsFpParamsInCLinkage()) {
+      MachineSignature::Builder builder(graph_zone, 1, 1);
+      builder.AddReturn(MachineType::Uint32());
+      builder.AddParam(MachineType::Float64());
+      desc = Linkage::GetSimplifiedCDescriptor(
+          graph_zone, builder.Get(), CallDescriptor::kNoFlags, Operator::kPure);
+    } else {
+      MachineSignature::Builder builder(graph_zone, 1, 2);
+      builder.AddReturn(MachineType::Uint32());
+      builder.AddParam(MachineType::Uint32());
+      builder.AddParam(MachineType::Uint32());
+      desc = Linkage::GetSimplifiedCDescriptor(
+          graph_zone, builder.Get(), CallDescriptor::kNoFlags, Operator::kPure);
+    }
+    ieee754_fp64_to_fp16_raw_bits_operator_.set(common()->Call(desc));
+  }
+  return ieee754_fp64_to_fp16_raw_bits_operator_.get();
 }
 
 void SimplifiedLowering::ChangeOp(Node* node, const Operator* new_op) {

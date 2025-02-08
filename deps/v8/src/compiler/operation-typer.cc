@@ -6,8 +6,8 @@
 
 #include "src/compiler/common-operator.h"
 #include "src/compiler/js-heap-broker.h"
+#include "src/compiler/turbofan-types.h"
 #include "src/compiler/type-cache.h"
-#include "src/compiler/types.h"
 #include "src/objects/oddball.h"
 
 namespace v8 {
@@ -582,6 +582,13 @@ Type OperationTyper::NumberToUint8Clamped(Type type) {
   return cache_->kUint8;
 }
 
+Type OperationTyper::NumberToFloat16RawBits(Type type) {
+  DCHECK(type.Is(Type::Number()));
+
+  if (type.Is(cache_->kUint16)) return type;
+  return cache_->kUint16;
+}
+
 Type OperationTyper::Integral32OrMinusZeroToBigInt(Type type) {
   DCHECK(type.Is(Type::Number()));
 
@@ -705,7 +712,7 @@ Type OperationTyper::NumberSubtract(Type lhs, Type rhs) {
   return type;
 }
 
-Type OperationTyper::SpeculativeSafeIntegerAdd(Type lhs, Type rhs) {
+Type OperationTyper::SpeculativeSmallIntegerAdd(Type lhs, Type rhs) {
   Type result = SpeculativeNumberAdd(lhs, rhs);
   // If we have a Smi or Int32 feedback, the representation selection will
   // either truncate or it will check the inputs (i.e., deopt if not int32).
@@ -715,7 +722,7 @@ Type OperationTyper::SpeculativeSafeIntegerAdd(Type lhs, Type rhs) {
   return Type::Intersect(result, cache_->kSafeIntegerOrMinusZero, zone());
 }
 
-Type OperationTyper::SpeculativeSafeIntegerSubtract(Type lhs, Type rhs) {
+Type OperationTyper::SpeculativeSmallIntegerSubtract(Type lhs, Type rhs) {
   Type result = SpeculativeNumberSubtract(lhs, rhs);
   // If we have a Smi or Int32 feedback, the representation selection will
   // either truncate or it will check the inputs (i.e., deopt if not int32).
@@ -1331,6 +1338,10 @@ Type OperationTyper::CheckFloat64Hole(Type type) {
 
 Type OperationTyper::CheckNumber(Type type) {
   return Type::Intersect(type, Type::Number(), zone());
+}
+
+Type OperationTyper::CheckNumberFitsInt32(Type type) {
+  return Type::Intersect(type, Type::Signed32(), zone());
 }
 
 Type OperationTyper::TypeTypeGuard(const Operator* sigma_op, Type input) {

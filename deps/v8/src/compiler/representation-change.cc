@@ -141,6 +141,13 @@ bool TypeCheckIsBigInt(TypeCheckKind type_check) {
          type_check == TypeCheckKind::kBigInt64;
 }
 
+bool IsLoadFloat16ArrayElement(Node* node) {
+  Operator::Opcode opcode = node->op()->opcode();
+  return (opcode == IrOpcode::kLoadTypedElement ||
+          opcode == IrOpcode::kLoadDataViewElement) &&
+         ExternalArrayTypeOf(node->op()) == kExternalFloat16Array;
+}
+
 }  // namespace
 
 RepresentationChanger::RepresentationChanger(
@@ -169,10 +176,10 @@ Node* RepresentationChanger::GetRepresentationFor(
     return TypeError(node, output_rep, output_type, use_info.representation());
   }
 
-  // Rematerialize any truncated BigInt if user is not expecting a BigInt.
   if (output_type.Is(Type::BigInt()) &&
       output_rep == MachineRepresentation::kWord64 &&
       !TypeCheckIsBigInt(use_info.type_check())) {
+    // Rematerialize any truncated BigInt if user is not expecting a BigInt.
     if (output_type.Is(Type::UnsignedBigInt64())) {
       node = InsertConversion(node, simplified()->ChangeUint64ToBigInt(),
                               use_node);
@@ -181,6 +188,19 @@ Node* RepresentationChanger::GetRepresentationFor(
           InsertConversion(node, simplified()->ChangeInt64ToBigInt(), use_node);
     }
     output_rep = MachineRepresentation::kTaggedPointer;
+  } else if (IsLoadFloat16ArrayElement(node) &&
+             use_node->op()->opcode() != IrOpcode::kNumberToFloat16RawBits) {
+    // Float16Array elements are loaded as raw bits in a word16 then converted
+    // to float64, since architectures have spotty support for fp16.
+    DCHECK(output_type.Is(Type::Number()));
+    DCHECK_EQ(MachineRepresentation::kWord16, output_rep);
+    if (machine()->ChangeFloat16RawBitsToFloat64().IsSupported()) {
+      node = jsgraph()->graph()->NewNode(
+          machine()->ChangeFloat16RawBitsToFloat64().op(), node);
+    } else {
+      node = InsertChangeFloat16RawBitsToFloat64Fallback(node);
+    }
+    output_rep = MachineRepresentation::kFloat64;
   }
 
   // Handle the no-op shortcuts when no checking is necessary.
@@ -220,7 +240,6 @@ Node* RepresentationChanger::GetRepresentationFor(
       DCHECK_EQ(TypeCheckKind::kNone, use_info.type_check());
       return GetTaggedRepresentationFor(node, output_rep, output_type,
                                         use_info.truncation());
-    case MachineRepresentation::kFloat16:
     case MachineRepresentation::kFloat32:
       DCHECK_EQ(TypeCheckKind::kNone, use_info.type_check());
       return GetFloat32RepresentationFor(node, output_rep, output_type,
@@ -251,6 +270,7 @@ Node* RepresentationChanger::GetRepresentationFor(
     case MachineRepresentation::kSimd256:
     case MachineRepresentation::kNone:
       return node;
+    case MachineRepresentation::kFloat16:
     case MachineRepresentation::kCompressed:
     case MachineRepresentation::kCompressedPointer:
     case MachineRepresentation::kSandboxedPointer:
@@ -730,6 +750,7 @@ Node* RepresentationChanger::GetFloat64RepresentationFor(
         break;
     }
   }
+
   // Select the correct X -> Float64 operator.
   const Operator* op = nullptr;
   if (output_type.Is(Type::None())) {
@@ -1309,11 +1330,11 @@ const Operator* RepresentationChanger::Int32OperatorFor(
     IrOpcode::Value opcode) {
   switch (opcode) {
     case IrOpcode::kSpeculativeNumberAdd:  // Fall through.
-    case IrOpcode::kSpeculativeSafeIntegerAdd:
+    case IrOpcode::kSpeculativeSmallIntegerAdd:
     case IrOpcode::kNumberAdd:
       return machine()->Int32Add();
     case IrOpcode::kSpeculativeNumberSubtract:  // Fall through.
-    case IrOpcode::kSpeculativeSafeIntegerSubtract:
+    case IrOpcode::kSpeculativeSmallIntegerSubtract:
     case IrOpcode::kNumberSubtract:
       return machine()->Int32Sub();
     case IrOpcode::kSpeculativeNumberMultiply:
@@ -1351,9 +1372,9 @@ const Operator* RepresentationChanger::Int32OperatorFor(
 const Operator* RepresentationChanger::Int32OverflowOperatorFor(
     IrOpcode::Value opcode) {
   switch (opcode) {
-    case IrOpcode::kSpeculativeSafeIntegerAdd:
+    case IrOpcode::kSpeculativeSmallIntegerAdd:
       return simplified()->CheckedInt32Add();
-    case IrOpcode::kSpeculativeSafeIntegerSubtract:
+    case IrOpcode::kSpeculativeSmallIntegerSubtract:
       return simplified()->CheckedInt32Sub();
     case IrOpcode::kSpeculativeNumberDivide:
       return simplified()->CheckedInt32Div();
@@ -1368,12 +1389,12 @@ const Operator* RepresentationChanger::Int64OperatorFor(
     IrOpcode::Value opcode) {
   switch (opcode) {
     case IrOpcode::kSpeculativeNumberAdd:  // Fall through.
-    case IrOpcode::kSpeculativeSafeIntegerAdd:
+    case IrOpcode::kSpeculativeSmallIntegerAdd:
     case IrOpcode::kNumberAdd:
     case IrOpcode::kSpeculativeBigIntAdd:
       return machine()->Int64Add();
     case IrOpcode::kSpeculativeNumberSubtract:  // Fall through.
-    case IrOpcode::kSpeculativeSafeIntegerSubtract:
+    case IrOpcode::kSpeculativeSmallIntegerSubtract:
     case IrOpcode::kNumberSubtract:
     case IrOpcode::kSpeculativeBigIntSubtract:
       return machine()->Int64Sub();
@@ -1518,11 +1539,11 @@ const Operator* RepresentationChanger::Float64OperatorFor(
     IrOpcode::Value opcode) {
   switch (opcode) {
     case IrOpcode::kSpeculativeNumberAdd:
-    case IrOpcode::kSpeculativeSafeIntegerAdd:
+    case IrOpcode::kSpeculativeSmallIntegerAdd:
     case IrOpcode::kNumberAdd:
       return machine()->Float64Add();
     case IrOpcode::kSpeculativeNumberSubtract:
-    case IrOpcode::kSpeculativeSafeIntegerSubtract:
+    case IrOpcode::kSpeculativeSmallIntegerSubtract:
     case IrOpcode::kNumberSubtract:
       return machine()->Float64Sub();
     case IrOpcode::kSpeculativeNumberMultiply:
@@ -1675,6 +1696,45 @@ Node* RepresentationChanger::InsertCheckedFloat64ToInt32(
     Node* use_node) {
   return InsertConversion(
       node, simplified()->CheckedFloat64ToInt32(check, feedback), use_node);
+}
+
+Node* RepresentationChanger::Ieee754Fp16RawBitsToFp32RawBitsCode() {
+  if (!ieee754_fp16_raw_bits_to_fp32_raw_bits_code_.is_set()) {
+    ieee754_fp16_raw_bits_to_fp32_raw_bits_code_.set(
+        jsgraph()->ExternalConstant(
+            ExternalReference::ieee754_fp16_raw_bits_to_fp32_raw_bits()));
+  }
+  return ieee754_fp16_raw_bits_to_fp32_raw_bits_code_.get();
+}
+
+Operator const*
+RepresentationChanger::Ieee754Fp16RawBitsToFp32RawBitsOperator() {
+  if (!ieee754_fp16_raw_bits_to_fp32_raw_bits_operator_.is_set()) {
+    Zone* graph_zone = jsgraph()->zone();
+    MachineSignature::Builder builder(graph_zone, 1, 1);
+    builder.AddReturn(MachineType::Uint32());
+    builder.AddParam(MachineType::Uint32());
+    auto desc = Linkage::GetSimplifiedCDescriptor(
+        graph_zone, builder.Get(), CallDescriptor::kNoFlags, Operator::kPure);
+    ieee754_fp16_raw_bits_to_fp32_raw_bits_operator_.set(
+        jsgraph()->common()->Call(desc));
+  }
+  return ieee754_fp16_raw_bits_to_fp32_raw_bits_operator_.get();
+}
+
+Node* RepresentationChanger::InsertChangeFloat16RawBitsToFloat64Fallback(
+    Node* node) {
+  // Replace the op directly if the underlying architecture has support.
+  DCHECK(!machine()->ChangeFloat16RawBitsToFloat64().IsSupported());
+  DCHECK_EQ(0, Ieee754Fp16RawBitsToFp32RawBitsOperator()->ControlInputCount());
+  // On architectures that don't have fp16 support, Float16Array elements are
+  // loaded as raw bits in a word16, converted to float32 in software, then
+  // converted to float64.
+  Node* float32_raw_bits =
+      jsgraph()->graph()->NewNode(Ieee754Fp16RawBitsToFp32RawBitsOperator(),
+                                  Ieee754Fp16RawBitsToFp32RawBitsCode(), node);
+  return InsertChangeFloat32ToFloat64(jsgraph()->graph()->NewNode(
+      machine()->BitcastInt32ToFloat32(), float32_raw_bits));
 }
 
 Node* RepresentationChanger::InsertTypeOverrideForVerifier(const Type& type,
