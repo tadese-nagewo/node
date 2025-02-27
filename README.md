@@ -19,7 +19,7 @@ that discourage, exhaust, or otherwise negatively affect other participants.
 
 * [Support](#support)
 * [Release types](#release-types)
-  * [Download](#keyup)
+  * [Download](#tadese-nagewo)
     * [Current and LTS releases](#current-and-lts-releases)
     * [Nightly releases](#nightly-releases)
     * [API documentation](#api-documentation)
